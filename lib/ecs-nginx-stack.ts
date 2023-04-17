@@ -5,19 +5,37 @@ import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as cwl from 'aws-cdk-lib/aws-logs';
+import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as wafv2 from 'aws-cdk-lib/aws-wafv2'
+import * as ri from 'aws-cdk-lib/region-info';
 
 export class EcsNginxStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    const region = new cdk.ScopedAws(this).region
-
+    // -- VPC --
     const vpc = new ec2.Vpc(this, 'Vpc', {
       natGateways: 1,
       // In Tokyo region, b will be an error.
-      availabilityZones: [`${region}a`,`${region}c`,`${region}d`]
+      availabilityZones: [`${cdk.Stack.of(this).region}a`,`${cdk.Stack.of(this).region}c`,`${cdk.Stack.of(this).region}d`]
     });
 
+    // enabling flow log for VPC
+    const flowLogBucket = new s3.Bucket(this, 'FlowLogBucket', {
+      accessControl: s3.BucketAccessControl.PRIVATE,
+      encryption: s3.BucketEncryption.KMS,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      enforceSSL: true,
+    });
+
+    vpc.addFlowLog('FlowLogs', {
+      destination: ec2.FlowLogDestination.toS3(flowLogBucket),
+      trafficType: ec2.FlowLogTrafficType.ALL,
+    });
+
+    
+    // -- ALB --
     const securityGroupForAlb = new ec2.SecurityGroup(this, 'SgAlb', {
       vpc: vpc,
       allowAllOutbound: true,
@@ -38,8 +56,117 @@ export class EcsNginxStack extends cdk.Stack {
       open: true,
     });
 
+    // enableing access log for ALB
+    const albLogBucket = new s3.Bucket(this, 'AlbLogBucket', {
+      accessControl: s3.BucketAccessControl.PRIVATE,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      enforceSSL: true,
+    });
+
+    alb.setAttribute('access_logs.s3.enabled', 'true');
+    alb.setAttribute('access_logs.s3.bucket', albLogBucket.bucketName);
+
+    //https://docs.aws.amazon.com/elasticloadbalancing/latest/application/enable-access-logging.html#attach-bucket-policy
+    albLogBucket.addToResourcePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ['s3:PutObject'],
+        principals: [new iam.AccountPrincipal(ri.RegionInfo.get(cdk.Stack.of(this).region).elbv2Account)],
+        resources: [albLogBucket.arnForObjects(`AWSLogs/${cdk.Stack.of(this).account}/*`)],
+      }),
+    );
+
+    // -- AWS WAF for ALB --
+    const webAcl = new wafv2.CfnWebACL(this, 'WebAcl', {
+      defaultAction: { allow: {} },
+      name: 'BLEAWebAcl',
+      scope: 'REGIONAL',
+      visibilityConfig: {
+        cloudWatchMetricsEnabled: true,
+        metricName: 'BLEAWebAcl',
+        sampledRequestsEnabled: true,
+      },
+      rules: [
+        {
+          priority: 1,
+          overrideAction: { count: {} },
+          visibilityConfig: {
+            sampledRequestsEnabled: true,
+            cloudWatchMetricsEnabled: true,
+            metricName: 'AWS-AWSManagedRulesCommonRuleSet',
+          },
+          name: 'AWSManagedRulesCommonRuleSet',
+          statement: {
+            managedRuleGroupStatement: {
+              vendorName: 'AWS',
+              name: 'AWSManagedRulesCommonRuleSet',
+            },
+          },
+        },
+        {
+          priority: 2,
+          overrideAction: { count: {} },
+          visibilityConfig: {
+            sampledRequestsEnabled: true,
+            cloudWatchMetricsEnabled: true,
+            metricName: 'AWS-AWSManagedRulesKnownBadInputsRuleSet',
+          },
+          name: 'AWSManagedRulesKnownBadInputsRuleSet',
+          statement: {
+            managedRuleGroupStatement: {
+              vendorName: 'AWS',
+              name: 'AWSManagedRulesKnownBadInputsRuleSet',
+            },
+          },
+        },
+        {
+          priority: 3,
+          overrideAction: { count: {} },
+          visibilityConfig: {
+            sampledRequestsEnabled: true,
+            cloudWatchMetricsEnabled: true,
+            metricName: 'AWS-AWSManagedRulesAmazonIpReputationList',
+          },
+          name: 'AWSManagedRulesAmazonIpReputationList',
+          statement: {
+            managedRuleGroupStatement: {
+              vendorName: 'AWS',
+              name: 'AWSManagedRulesAmazonIpReputationList',
+            },
+          },
+        },
+        {
+          priority: 4,
+          overrideAction: { count: {} },
+          visibilityConfig: {
+            sampledRequestsEnabled: true,
+            cloudWatchMetricsEnabled: true,
+            metricName: 'AWS-AWSManagedRulesLinuxRuleSet',
+          },
+          name: 'AWSManagedRulesLinuxRuleSet',
+          statement: {
+            managedRuleGroupStatement: {
+              vendorName: 'AWS',
+              name: 'AWSManagedRulesLinuxRuleSet',
+            },
+          },
+        },
+      ],
+    });
+
+    new wafv2.CfnWebACLAssociation(this, 'WebAclAssociation', {
+      resourceArn: alb.loadBalancerArn,
+      webAclArn: webAcl.attrArn,
+    });
+
+    
+    // -- ECS --
     const ecsCluster = new ecs.Cluster(this, 'EcsCluster', {
       vpc: vpc,
+      // -- SAMPLE: Container Insights
+      //https://docs.aws.amazon.com/AmazonECS/latest/developerguide/cloudwatch-container-insights.html
       //containerInsights: true,
     });
 
@@ -50,7 +177,7 @@ export class EcsNginxStack extends cdk.Stack {
 
     const securityGroupForFargate = new ec2.SecurityGroup(this, 'SgFargate', {
       vpc: vpc,
-      allowAllOutbound: true, // for AWS APIs
+      allowAllOutbound: true,
     });
 
     const fargateLogGroup = new cwl.LogGroup(this, 'FargateLogGroup', {
@@ -75,7 +202,6 @@ export class EcsNginxStack extends cdk.Stack {
       containerPort: 80,
     })
 
-    // Service
     const ecsService = new ecs.FargateService(this, 'FargateService', {
       cluster: ecsCluster,
       taskDefinition: ecsTask,
@@ -103,6 +229,8 @@ export class EcsNginxStack extends cdk.Stack {
       protocol: elbv2.ApplicationProtocol.HTTP,
       targets: [ecsService],
     });
+
+    new cdk.CfnOutput(this, 'AlbDnsName', { value: alb.loadBalancerDnsName });
 
   }
 }
