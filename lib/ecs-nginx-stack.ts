@@ -9,13 +9,20 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as wafv2 from 'aws-cdk-lib/aws-wafv2'
 import * as ri from 'aws-cdk-lib/region-info';
 
+export interface EcsNginxStackProps extends cdk.StackProps{
+  cidr: string;
+  taskMin: number;
+  taskMax: number;
+}
+
 export class EcsNginxStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+  constructor(scope: Construct, id: string, props: EcsNginxStackProps) {
     super(scope, id, props);
 
     // -- VPC --
     const vpc = new ec2.Vpc(this, 'Vpc', {
       natGateways: 1,
+      ipAddresses: ec2.IpAddresses.cidr(props.cidr),
       // In Tokyo region, b will be an error.
       availabilityZones: [`${cdk.Stack.of(this).region}a`,`${cdk.Stack.of(this).region}c`,`${cdk.Stack.of(this).region}d`]
     });
@@ -79,13 +86,12 @@ export class EcsNginxStack extends cdk.Stack {
     );
 
     // -- AWS WAF for ALB --
-    const webAcl = new wafv2.CfnWebACL(this, 'WebAcl', {
+    const webAcl = new wafv2.CfnWebACL(this, `${cdk.Stack.of(this).stackName}-WebAcl`, {
       defaultAction: { allow: {} },
-      name: 'BLEAWebAcl',
       scope: 'REGIONAL',
       visibilityConfig: {
         cloudWatchMetricsEnabled: true,
-        metricName: 'BLEAWebAcl',
+        metricName: 'WebAcl',
         sampledRequestsEnabled: true,
       },
       rules: [
@@ -228,6 +234,17 @@ export class EcsNginxStack extends cdk.Stack {
     lbForAppListener.addTargets('nginx', {
       protocol: elbv2.ApplicationProtocol.HTTP,
       targets: [ecsService],
+    });
+
+    // ECS Task AutoScaling
+    // https://docs.aws.amazon.com/cdk/api/latest/docs/aws-ecs-readme.html#task-auto-scaling
+    const ecsScaling = ecsService.autoScaleTaskCount({
+      minCapacity: props.taskMin,
+      maxCapacity: props.taskMax,
+    });
+
+    ecsScaling.scaleOnCpuUtilization('CpuScaling', {
+      targetUtilizationPercent: 60,
     });
 
     new cdk.CfnOutput(this, 'AlbDnsName', { value: alb.loadBalancerDnsName });
